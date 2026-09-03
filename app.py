@@ -6,10 +6,37 @@ import re
 import pickle
 import matplotlib.pyplot as plt
 from sklearn.ensemble import IsolationForest
+import streamlit_authenticator as stauth
 
 # ==================== 全局设置 ====================
 st.set_page_config(page_title="光伏组串故障检测", layout="wide")
 st.title("光伏组件无监督故障检测系统")
+
+# 设置用户和密码
+credentials = {'usernames': {
+                'Admin': {'email': 'Admin',
+                          'name': 'Admin',
+                          'password': 'Admin'}}}
+# 设置登录窗口
+authenticator = stauth.Authenticate(credentials)
+authenticator.login('main',
+                    fields={'Form name': '光伏组件无监督故障检测系统',
+                            'Username': '用户名',
+                            'Password': '密码',
+                            'Login': '登录'})
+# 判断用户登陆状态
+if st.session_state['authentication_status']:
+    col_a, col_b = st.columns(spec=[8, 1], vertical_alignment='bottom')
+    with col_a:
+        st.header('光伏组件无监督故障检测系统')
+    with col_b:
+        authenticator.logout(button_name='退出登录')
+elif st.session_state['authentication_status'] is False:
+    st.error("用户名或密码不正确！", icon="🚨")
+    st.stop()
+elif st.session_state['authentication_status'] is None:
+    st.info('请输入用户名和密码！', icon="ℹ️")
+    st.stop()
 
 # 中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
