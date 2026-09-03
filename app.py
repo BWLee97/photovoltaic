@@ -10,13 +10,13 @@ import streamlit_authenticator as stauth
 
 # ==================== 全局设置 ====================
 st.set_page_config(page_title="光伏组串故障检测", layout="wide")
-st.title("光伏组件无监督故障检测系统")
+# st.title("光伏组件无监督故障检测系统")
 
 # 设置用户和密码
 credentials = {'usernames': {
-                'Admin': {'email': 'Admin',
-                          'name': 'Admin',
-                          'password': 'Admin'}}}
+                'Admin': {'email': 'admin',
+                          'name': 'admin',
+                          'password': 'admin'}}}
 # 设置登录窗口
 authenticator = stauth.Authenticate(credentials)
 authenticator.login('main',
