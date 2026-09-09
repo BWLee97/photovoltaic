@@ -4,24 +4,38 @@ import pandas as pd
 import numpy as np
 import os
 import re
-import pickle
-import matplotlib.pyplot as plt
+import joblib
 from sklearn.ensemble import IsolationForest
+import matplotlib.pyplot as plt
 
 # ==================== 全局设置 ====================
-st.set_page_config(page_title="光伏组串故障检测", layout="wide")
+st.set_page_config(page_title="光伏组串故障检测")
 
-# 中文字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
-# 创建缓存文件夹
 CACHE_DIR = "Cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# ==================== 诊断参数 ====================
+GEN_REL = 0.10
+MIN_GROUP_N = 5
+POINT_V_LOW = -0.10
+DAY_MIN_POINTS = 20
+DAY_V_MED = -0.08
+DAY_LOW_RATIO = 0.30
+MIN_ABNORMAL_DAYS = 2
+
+DUST_V_DEEP = -0.40
+DUST_HALF = -0.30
+GLASS_V_LO, GLASS_V_HI = -0.40, -0.08
+GLASS_MIN_DAYS = 4
+SHADE_MAX_DAYS = 3
+SHADE_AM_NEAR, SHADE_PM_DEEP = -0.05, -0.12
+I_CODROP = -0.10
+
 # ==================== 辅助函数 ====================
 def parse_time(time_str):
-    """解析时间字符串"""
     if pd.isna(time_str):
         return pd.NaT
     try:
@@ -30,7 +44,6 @@ def parse_time(time_str):
         return pd.to_datetime(time_str, errors='coerce')
 
 def extract_component_and_type(col_name):
-    """从列名提取组件名和类型"""
     patterns = {
         '电流': r'(.+)/输出电流\(A\)$',
         '电压': r'(.+)/输出电压\(V\)$',
@@ -43,11 +56,6 @@ def extract_component_and_type(col_name):
     return None, None
 
 def process_uploaded_files(files):
-    """
-    处理上传的多个 Excel 文件，合并为宽表 df_all
-    参数 files: list of UploadedFile
-    返回 df_all 或 None
-    """
     df_list = []
     for file in files:
         try:
@@ -78,10 +86,7 @@ def process_uploaded_files(files):
 
         keep_cols = ['时间'] + component_cols
         df_sub = df_raw[keep_cols].copy()
-
-        df_sub.replace('--', np.nan, inplace=True)
-        df_sub.replace('—', np.nan, inplace=True)
-        df_sub.replace('', np.nan, inplace=True)
+        df_sub.replace(['--', '—', ''], np.nan, inplace=True)
 
         for col in component_cols:
             df_sub[col] = pd.to_numeric(df_sub[col], errors='coerce')
@@ -97,8 +102,13 @@ def process_uploaded_files(files):
         df_long['组件'] = df_long['原始列名'].apply(lambda x: component_type_map[x][0])
         df_long['类型'] = df_long['原始列名'].apply(lambda x: component_type_map[x][1])
 
+        df_long['组'] = df_long['组件'].apply(
+            lambda comp: re.match(r"智能组件(2-\d+)-\d+", comp).group(1)
+            if re.match(r"智能组件(2-\d+)-\d+", comp) else None
+        )
+
         df_pivot = df_long.pivot_table(
-            index=['时间', '组件'],
+            index=['时间', '组', '组件'],
             columns='类型',
             values='数值',
             aggfunc='first'
@@ -112,280 +122,156 @@ def process_uploaded_files(files):
         return None
 
     df_all = pd.concat(df_list, ignore_index=True)
-    df_all.sort_values(['时间', '组件'], inplace=True)
-    df_all.drop_duplicates(subset=['时间', '组件'], keep='first', inplace=True)
+    df_all.sort_values(['组', '组件', '时间'], inplace=True)
+    df_all.drop_duplicates(subset=['组', '组件', '时间'], keep='first', inplace=True)
     df_all.reset_index(drop=True, inplace=True)
     return df_all
 
-def train_model(df_all):
-    """
-    使用 df_all 训练孤立森林模型
-    返回模型和特征列名
-    """
-    df = df_all.dropna(subset=['电流(A)', '电压(V)', '功率(kW)']).copy()
+def add_peer_deviation(long):
+    g = long.groupby(["组", "时间"], sort=False)
+    df = long.copy()
+    df["电流中位"] = g["电流(A)"].transform("median")
+    df["电压中位"] = g["电压(V)"].transform("median")
+    df["功率中位"] = g["功率(kW)"].transform("median")
+    df["组内组件数"] = g["组件"].transform("count")
 
-    min_components = 5
-    time_counts = df.groupby('时间')['组件'].transform('count')
-    df = df[time_counts >= min_components]
+    mad_i = g["电流(A)"].transform(lambda s: (s - s.median()).abs().median())
+    mad_v = g["电压(V)"].transform(lambda s: (s - s.median()).abs().median())
 
-    df['电流中位数'] = df.groupby('时间')['电流(A)'].transform('median')
-    df['电压中位数'] = df.groupby('时间')['电压(V)'].transform('median')
+    df["电流偏差"] = (df["电流(A)"] - df["电流中位"]) / df["电流中位"].replace(0, np.nan)
+    df["电压偏差"] = (df["电压(V)"] - df["电压中位"]) / df["电压中位"].replace(0, np.nan)
+    df["功率偏差"] = (df["功率(kW)"] - df["功率中位"]) / df["功率中位"].replace(0, np.nan)
 
-    df['电流偏差'] = (df['电流(A)'] - df['电流中位数']) / df['电流中位数'].replace(0, np.nan)
-    df['电压偏差'] = (df['电压(V)'] - df['电压中位数']) / df['电压中位数'].replace(0, np.nan)
+    df["电流rz"] = 0.6745 * (df["电流(A)"] - df["电流中位"]) / mad_i.replace(0, np.nan)
+    df["电压rz"] = 0.6745 * (df["电压(V)"] - df["电压中位"]) / mad_v.replace(0, np.nan)
 
-    df_model = df.dropna(subset=['电流偏差', '电压偏差'])
+    peak = df.groupby("组")["电流中位"].transform("max")
+    df["有效发电"] = (df["电流中位"] >= GEN_REL * peak) & (df["电流中位"] > 1e-9)
+    df["低压点"] = df["电压偏差"] < POINT_V_LOW
+    return df
 
-    features = ['电流偏差', '电压偏差']
-    X = df_model[features].values
+def build_day_table(df):
+    d = df[df["有效发电"] & (df["组内组件数"] >= MIN_GROUP_N)].copy()
+    d["日期"] = d["时间"].dt.date
+    d["小时"] = d["时间"].dt.hour
 
-    iso_forest = IsolationForest(contamination='auto', random_state=42)
-    iso_forest.fit(X)
+    def agg_day(s):
+        return pd.Series({
+            "点数": s["电压偏差"].size,
+            "V日中位": s["电压偏差"].median(),
+            "V日均值": s["电压偏差"].mean(),
+            "低压点占比": s["低压点"].mean(),
+            "I日中位": s["电流偏差"].median(),
+            "P日中位": s["功率偏差"].median(),
+            "V上午": s.loc[s["小时"].between(8, 12), "电压偏差"].mean(),
+            "V下午": s.loc[s["小时"].between(13, 17), "电压偏差"].mean(),
+        })
+    day_tbl = d.groupby(["组", "组件", "日期"]).apply(agg_day).reset_index()
+    day_tbl = day_tbl[day_tbl["点数"] >= DAY_MIN_POINTS].copy()
+    day_tbl["异常日"] = (day_tbl["V日中位"] <= DAY_V_MED) | (day_tbl["低压点占比"] >= DAY_LOW_RATIO)
+    return d, day_tbl
 
-    return iso_forest, features
+def classify(nbad, sv, si, am, pm):
+    if sv <= DUST_V_DEEP and (am <= DUST_HALF) and (pm <= DUST_HALF):
+        return "积灰/脏污"
+    if nbad <= SHADE_MAX_DAYS and (
+        (am > SHADE_AM_NEAR and pm <= SHADE_PM_DEEP) or (pm > SHADE_AM_NEAR and am <= SHADE_PM_DEEP)):
+        return "遮挡"
+    if nbad >= GLASS_MIN_DAYS and (GLASS_V_HI >= sv > GLASS_V_LO):
+        return "玻璃破碎/硬件损伤"
+    return "电压持续偏低(待复核)"
 
-def classify_fault(avg_i_dev, avg_v_dev):
-    """
-    根据偏差均值进行故障分类（单点或窗口均值）
-    返回故障类型字符串
-    """
-    if avg_v_dev < -0.15 and avg_i_dev > -0.15:
-        return '接线盒异常'
-    elif avg_i_dev < -0.15 and abs(avg_v_dev) < 0.05:
-        return '遮挡（热斑、积灰）'
-    elif avg_i_dev < -0.3 and avg_v_dev < -0.05:
-        return '玻璃破碎'
-    else:
-        return '其他'
+def diagnose(df, day_tbl):
+    recs = []
+    for (grp, comp), s in day_tbl.groupby(["组", "组件"]):
+        ab = s[s["异常日"]]
+        nbad = int(ab["日期"].nunique())
+        ndays = int(s["日期"].nunique())
+        sv = ab["V日中位"].median()
+        si = ab["I日中位"].median()
+        sp = ab["P日中位"].median()
+        am = ab["V上午"].mean()
+        pm = ab["V下午"].mean()
+        flagged = nbad >= MIN_ABNORMAL_DAYS
+        ftype = classify(nbad, sv, si, am, pm) if flagged else "正常"
 
-def plot_comparison_bar(df_single):
-    """
-    绘制单点检测的横向对比条形图，高亮异常组串
-    """
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    colors = ['red' if flag else 'steelblue' for flag in df_single['是否异常']]
-    axes[0].bar(df_single['组件'], df_single['电流(A)'], color=colors)
-    axes[0].set_title('各组串电流对比')
-    axes[0].set_xlabel('组件')
-    axes[0].set_ylabel('电流 (A)')
-    axes[0].tick_params(axis='x', rotation=45)
-    axes[1].bar(df_single['组件'], df_single['电压(V)'], color=colors)
-    axes[1].set_title('各组串电压对比')
-    axes[1].set_xlabel('组件')
-    axes[1].set_ylabel('电压 (V)')
-    axes[1].tick_params(axis='x', rotation=45)
-    plt.tight_layout()
-    return fig
-
-# ==================== 页面函数 ====================
-def train_page():
-    st.subheader("模型训练")
-
-    uploaded_files = st.file_uploader(
-        "请上传系统导出Excel原始文件（务必一次性上传所有数据文件）：",
-        type=["xlsx"],
-        accept_multiple_files=True,
-        key="train_uploader"
-    )
-
-    if uploaded_files:
-        with st.spinner('正在处理数据...'):
-            df_all = process_uploaded_files(uploaded_files)
-            if df_all is not None:
-                df_all.to_excel(os.path.join(CACHE_DIR, "df_all.xlsx"), index=False)
-                st.success(f"数据处理完成，共 {len(df_all)} 条记录，{df_all['组件'].nunique()} 个组件。")
+        if flagged:
+            if nbad >= 4 and sv <= DUST_V_DEEP:
+                level = "红色预警"
+            elif nbad >= 4 or sv <= -0.15:
+                level = "橙色预警"
             else:
-                st.error("未从上传文件中提取到有效数据，请检查文件格式。")
-
-    data = None
-    data_path = os.path.join(CACHE_DIR, "df_all.xlsx")
-    if os.path.exists(data_path):
-        data = pd.read_excel(data_path)
-        if 'Unnamed: 0' in data.columns:
-            data = data.drop(columns=['Unnamed: 0'])
-        if '时间' in data.columns:
-            data['时间'] = pd.to_datetime(data['时间'], errors='coerce')
-
-    with st.expander('查看数据', expanded=True):
-        if data is None:
-            st.warning("尚未检索到有效数据，请上传数据。")
+                level = "黄色预警"
         else:
-            st.dataframe(data, use_container_width=True)
+            level = "—"
 
-    train_button_disabled = (data is None) or (data.empty) or \
-                            not {'电流(A)', '电压(V)', '功率(kW)'}.issubset(data.columns)
+        recs.append({
+            "组": grp,
+            "组件": comp,
+            "覆盖天数": ndays,
+            "异常日数": nbad,
+            "异常日电压中位": sv,
+            "异常日电流中位": si,
+            "异常日功率中位": sp,
+            "异常日上午电压": am,
+            "异常日下午电压": pm,
+            "电流是否伴生下降": "是" if pd.notna(si) and si <= I_CODROP else "否",
+            "是否报警": "是" if flagged else "否",
+            "故障类型": ftype,
+            "严重程度": level
+        })
+    comp_tbl = pd.DataFrame(recs).sort_values(
+        ["是否报警", "异常日电压中位"],
+        ascending=[False, True]
+    ).reset_index(drop=True)
+    return comp_tbl
 
-    if st.button("训练模型", disabled=train_button_disabled):
-        with st.spinner("训练中..."):
-            model, features = train_model(data)
-            with open(os.path.join(CACHE_DIR, "model.pkl"), 'wb') as f:
-                pickle.dump({'model': model, 'features': features}, f)
-            st.success("模型训练完成！")
+def train_or_load_isoforest(day_points, cache_dir):
+    model_path = os.path.join(cache_dir, "isolation_forest.pkl")
+    X = day_points[["电压偏差", "电流偏差", "功率偏差"]].replace([np.inf, -np.inf], np.nan).dropna()
 
-def detect_page():
-    st.subheader("模型应用")
+    if len(X) < 100:
+        st.warning("有效点太少，无法训练孤立森林，IF分数将为空")
+        return None, pd.Series(dtype=float)
 
-    model_path = os.path.join(CACHE_DIR, "model.pkl")
-    model_available = os.path.exists(model_path)
-
-    if model_available:
-        with open(model_path, 'rb') as f:
-            model_data = pickle.load(f)
-            iso_forest = model_data['model']
-            features = model_data['features']
-        st.success("已检测到训练好的模型，已加载完成。")
+    if os.path.exists(model_path):
+        try:
+            model = joblib.load(model_path)
+        except:
+            st.warning("模型文件损坏，重新训练")
+            model = None
     else:
-        st.warning("未检测到训练好的模型，请先完成训练模型步骤。")
+        model = None
 
-    input_mode = st.selectbox(
-        "选择输入方式",
-        ["手动输入（单点检测）", "上传文件（窗口检测）"],
-        disabled=not model_available
-    )
+    if model is None:
+        model = IsolationForest(contamination=0.02, random_state=42)
+        model.fit(X.values)
+        joblib.dump(model, model_path)
 
-    if input_mode == "手动输入（单点检测）":
-        st.caption("请输入至少5个组串在同一时刻的电流(A)和电压(V)，组件名称可自定义。")
-        
-        with st.form("manual_form"):
-            init_data = pd.DataFrame({
-                '组件': ['组件1', '组件2', '组件3', '组件4', '组件5'],
-                '电流(A)': [0.0, 0.0, 0.0, 0.0, 0.0],
-                '电压(V)': [0.0, 0.0, 0.0, 0.0, 0.0]
-            })
-            edited_df = st.data_editor(
-                init_data,
-                num_rows="dynamic",
-                use_container_width=True,
-                key="manual_editor",
-                disabled=not model_available
-            )
-            submitted = st.form_submit_button("检测", disabled=not model_available)
-        
-        if submitted:
-            if len(edited_df) < 5:
-                with st.expander('检测结果', expanded=True):
-                    st.error("至少需要5个组串才能进行横向对比。")
-            elif edited_df['电流(A)'].isna().any() or edited_df['电压(V)'].isna().any():
-                with st.expander('检测结果', expanded=True):
-                    st.error("电流和电压不能为空。")
-            else:
-                median_i = edited_df['电流(A)'].median()
-                median_v = edited_df['电压(V)'].median()
-                if median_i == 0 or median_v == 0:
-                    with st.expander('检测结果', expanded=True):
-                        st.error("中位数为0，无法计算偏差，请检查输入值。")
-                else:
-                    edited_df['电流偏差'] = (edited_df['电流(A)'] - median_i) / median_i
-                    edited_df['电压偏差'] = (edited_df['电压(V)'] - median_v) / median_v
-                    
-                    X_input = edited_df[features].values
-                    pred_labels = iso_forest.predict(X_input)
-                    edited_df['是否异常'] = pred_labels == -1
-                    
-                    fault_types = []
-                    for idx, row in edited_df.iterrows():
-                        if row['是否异常']:
-                            fault = classify_fault(row['电流偏差'], row['电压偏差'])
-                            fault_types.append(fault)
-                        else:
-                            fault_types.append('正常')
-                    edited_df['故障类型'] = fault_types
-                    
-                    with st.expander('检测结果', expanded=True):
-                        result_df = edited_df[['组件', '电流(A)', '电压(V)', '电流偏差', '电压偏差', '是否异常', '故障类型']]
-                        st.dataframe(result_df, use_container_width=True)
-        else:
-            with st.expander('检测结果'):
-                st.info("请输入至少5个组串在同一时刻的电流(A)和电压(V)，编辑完成后点击“检测”。")
+    scores = model.decision_function(X.values)
+    out = pd.Series(scores, index=X.index)
+    return model, out
 
-    else:
-        new_files = st.file_uploader(
-            "请上传与训练数据格式相同的Excel文件：",
-            type=["xlsx"],
-            accept_multiple_files=True,
-            key="predict_uploader",
-            disabled=not model_available
-        )
-        
-        if new_files:
-            with st.spinner("处理数据..."):
-                df_new = process_uploaded_files(new_files)
-                if df_new is None or df_new.empty:
-                    st.error("未提取到有效数据，请检查文件。")
-                else:
-                    st.success(f"数据加载成功，共 {len(df_new)} 条记录。")
-                    
-                    df = df_new.dropna(subset=['电流(A)', '电压(V)', '功率(kW)']).copy()
-                    min_components = 5
-                    time_counts = df.groupby('时间')['组件'].transform('count')
-                    df = df[time_counts >= min_components]
-                    
-                    df['电流中位数'] = df.groupby('时间')['电流(A)'].transform('median')
-                    df['电压中位数'] = df.groupby('时间')['电压(V)'].transform('median')
-                    df['电流偏差'] = (df['电流(A)'] - df['电流中位数']) / df['电流中位数'].replace(0, np.nan)
-                    df['电压偏差'] = (df['电压(V)'] - df['电压中位数']) / df['电压中位数'].replace(0, np.nan)
-                    df = df.dropna(subset=['电流偏差', '电压偏差'])
-                    
-                    X_new = df[features].values
-                    df['异常标签'] = iso_forest.predict(X_new)
-                    
-                    df = df.set_index('时间')
-                    window = '1H'
-                    alert_ratio = df.groupby('组件').resample(window)['异常标签'].apply(
-                        lambda x: (x == -1).mean()
-                    )
-                    alerts = alert_ratio[alert_ratio > 0.5]
-                    
-                    diagnosis_results = []
-                    for (comp, window_start), ratio in alerts.items():
-                        window_end = window_start + pd.Timedelta(window)
-                        mask = (df['组件'] == comp) & (df.index >= window_start) & (df.index < window_end)
-                        sub = df[mask]
-                        avg_i_dev = sub['电流偏差'].mean()
-                        avg_v_dev = sub['电压偏差'].mean()
-                        fault = classify_fault(avg_i_dev, avg_v_dev)
-                        if fault == '其他':
-                            fault = '未识别'
-                        
-                        if 0.5 < ratio <= 0.7:
-                            severity = '黄色预警'
-                        elif 0.7 < ratio <= 0.9:
-                            severity = '橙色预警'
-                        else:
-                            severity = '红色预警'
-                        
-                        diagnosis_results.append({
-                            '组件': comp,
-                            '时间窗口': window_start,
-                            '异常比例': ratio,
-                            '平均电流偏差': avg_i_dev,
-                            '平均电压偏差': avg_v_dev,
-                            '严重程度': severity,
-                            '故障类型': fault
-                        })
-                    
-                    if diagnosis_results:
-                        diagnosis_df = pd.DataFrame(diagnosis_results)
-                        with st.expander('检测结果'):
-                            st.dataframe(diagnosis_df, use_container_width=True)
-                    else:
-                        with st.expander('检测结果'):
-                            st.info("未检测到持续异常报警。")
-        else:
-            with st.expander('检测结果'):
-                st.info("请上传与训练数据格式相同的Excel文件")
-
-# ==================== 登录与导航 ====================
-credentials = {'usernames': {
-                'Admin': {'email': 'admin',
-                          'name': 'admin',
-                          'password': 'admin'}}}
+# ==================== 登录认证 ====================
+credentials = {
+    'usernames': {
+        'Admin': {
+            'email': 'admin',
+            'name': 'admin',
+            'password': 'admin'
+        }
+    }
+}
 authenticator = stauth.Authenticate(credentials)
-authenticator.login('main',
-                    fields={'Form name': '光伏组件无监督故障检测系统',
-                            'Username': '用户名',
-                            'Password': '密码',
-                            'Login': '登录'})
+authenticator.login(
+    'main',
+    fields={
+        'Form name': '光伏组件无监督故障检测系统',
+        'Username': '用户名',
+        'Password': '密码',
+        'Login': '登录'
+    }
+)
 
 if st.session_state['authentication_status'] is False:
     st.error("用户名或密码不正确！", icon="🚨")
@@ -394,20 +280,119 @@ elif st.session_state['authentication_status'] is None:
     st.info('请输入用户名和密码！', icon="ℹ️")
     st.stop()
 
-# 登录成功，显示顶部导航
-pages = {
-    "模型训练": [
-        st.Page(train_page, title="训练模型"),
-    ],
-    "模型应用": [
-        st.Page(detect_page, title="故障检测"),
-    ],
-}
+# ==================== 主界面（始终展示完整结构） ====================
+st.title("光伏组串故障检测")
 
-pg = st.navigation(pages, position="top")
-pg.run()
-
-# 退出登录放在侧边栏
+# 侧边栏用户信息
 with st.sidebar:
     st.write(f"当前用户：{st.session_state['name']}")
     authenticator.logout(button_name='退出登录')
+
+# 上传数据区域
+# st.subheader("1. 上传数据")
+uploaded_files = st.file_uploader(
+    "请上传系统导出Excel原始文件（可多选，务必一次性上传所有数据文件）：",
+    type=["xlsx"],
+    accept_multiple_files=True,
+    key="diagnosis_uploader"
+)
+
+# 处理上传文件，若存在则更新session_state并清除旧诊断结果
+if uploaded_files:
+    if 'uploaded_files' not in st.session_state or st.session_state['uploaded_files'] != uploaded_files:
+        st.session_state['uploaded_files'] = uploaded_files
+        with st.spinner('正在处理数据...'):
+            df_all = process_uploaded_files(uploaded_files)
+            if df_all is not None and not df_all.empty:
+                st.session_state['df_all'] = df_all
+                # 清除旧诊断结果
+                st.session_state.pop('comp_tbl', None)
+                st.session_state.pop('day_tbl', None)
+                st.session_state.pop('day_points', None)
+                st.success(f"数据加载成功，共 {len(df_all)} 条记录，{df_all['组件'].nunique()} 个组件。")
+            else:
+                st.session_state.pop('df_all', None)
+                st.error("未从上传文件中提取到有效数据，请检查文件格式。")
+else:
+    # 若未上传文件，清空可能存在的旧数据
+    st.session_state.pop('df_all', None)
+    st.session_state.pop('comp_tbl', None)
+    st.session_state.pop('day_tbl', None)
+    st.session_state.pop('day_points', None)
+    st.info("请上传数据文件。")
+
+# 原始数据预览区域（始终显示，无数据时提示）
+# st.subheader("2. 查看原始数据")
+with st.expander("点击展开原始数据表格（前1000行）", expanded=False):
+    if 'df_all' in st.session_state and st.session_state['df_all'] is not None:
+        st.dataframe(st.session_state['df_all'].head(1000), use_container_width=True)
+    else:
+        st.warning("暂无数据，请先上传文件。")
+
+# 运行诊断按钮（无数据时禁用）
+# st.subheader("3. 运行诊断")
+if st.button("运行诊断", type="primary", disabled=('df_all' not in st.session_state)):
+    with st.spinner("正在执行诊断，请稍候..."):
+        df_all = st.session_state['df_all']
+        dev = add_peer_deviation(df_all)
+        day_points, day_tbl = build_day_table(dev)
+        comp_tbl = diagnose(dev, day_tbl)
+        model, if_scores = train_or_load_isoforest(day_points, CACHE_DIR)
+        day_points["IF分数"] = np.nan
+        if if_scores is not None:
+            day_points.loc[if_scores.index, "IF分数"] = if_scores.values
+
+        st.session_state['comp_tbl'] = comp_tbl
+        st.session_state['day_tbl'] = day_tbl
+        st.session_state['day_points'] = day_points
+        st.success("诊断完成！")
+
+if 'df_all' not in st.session_state:
+    st.info("请先上传数据后再运行诊断。")
+
+# 诊断结果区域（始终显示三个标签页，无结果时提示）
+# st.subheader("4. 诊断结果")
+tab1, tab2, tab3 = st.tabs(["组件级诊断", "组件×天画像", "偏差明细"])
+
+with tab1:
+    if 'comp_tbl' in st.session_state:
+        comp_tbl = st.session_state['comp_tbl']
+        st.dataframe(comp_tbl, use_container_width=True)
+        csv = comp_tbl.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="下载组件级诊断 CSV",
+            data=csv,
+            file_name="诊断结果_组件级.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("暂无诊断结果，请先运行诊断。")
+
+with tab2:
+    if 'day_tbl' in st.session_state:
+        day_tbl = st.session_state['day_tbl']
+        st.dataframe(day_tbl, use_container_width=True)
+        csv = day_tbl.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="下载组件×天画像 CSV",
+            data=csv,
+            file_name="组件x天画像.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("暂无诊断结果，请先运行诊断。")
+
+with tab3:
+    if 'day_points' in st.session_state:
+        day_points = st.session_state['day_points']
+        st.write(f"共 {len(day_points)} 行，显示前 5000 行")
+        st.dataframe(day_points.head(5000), use_container_width=True)
+        csv = day_points.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="下载偏差明细 CSV（全部）",
+            data=csv,
+            file_name="偏差明细.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("暂无诊断结果，请先运行诊断。")
